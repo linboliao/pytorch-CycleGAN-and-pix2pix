@@ -33,5 +33,6 @@
       "used_levels": 7
     }
   },
-  "component_merge_gap_fraction": 0.045
+  "component_merge_gap_fraction": 0.045,
+  "dhr_tmp_root": "/tmp/vsseg_dhr_auto_component"
 }

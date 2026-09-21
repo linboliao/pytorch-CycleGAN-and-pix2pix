@@ -572,7 +572,7 @@ def dhr_smoke(he_slide, ihc_slide, he_component, matrix_level0, he_sx, he_sy, ar
         device=args.dhr_device,
         overrides=args.dhr_overrides,
         source_valid_mask=ihc_valid,
-        temporary_root=str(Path(args.output_root)/"tmp"),
+        temporary_root=args.dhr_tmp_root,
         return_valid_mask=True,
     )
     he_patch=center_crop(he_context,patch)
@@ -748,6 +748,7 @@ def parser():
     p.add_argument("--affine-margin",type=int,default=config["affine_margin"])
     p.add_argument("--dhr-preset",default=config["dhr_preset"])
     p.add_argument("--dhr-device",default=config["dhr_device"])
+    p.add_argument("--dhr-tmp-root",default=config["dhr_tmp_root"])
     p.add_argument("--run-dhr",action=argparse.BooleanOptionalAction,default=True)
     p.set_defaults(dhr_overrides=config["dhr_overrides"])
     return p
