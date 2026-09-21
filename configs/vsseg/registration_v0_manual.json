@@ -1,0 +1,50 @@
+{
+  "schema_version": 2,
+  "project_root": "/NAS145/linboliao/Data/VS-Seg",
+  "output_root": "/NAS145/linboliao/Data/VS-Seg/derived/registration_v0_manual_v2",
+  "aslide_root": "/NAS3/lbliao/Code-138/aslide",
+  "dhr_root": "/NAS3/lbliao/Code-138/DeeperHistReg",
+  "families": [
+    "dual",
+    "ckpan"
+  ],
+  "min_landmarks": 7,
+  "require_matching_names": true,
+  "ransac_threshold_px": 25.0,
+  "patch_size": 1024,
+  "context_size": 2048,
+  "stride": 1024,
+  "min_tissue_fraction": 0.5,
+  "max_patches_per_pair": 256,
+  "planning_max_downsample": 64.0,
+  "affine_margin": 128,
+  "min_valid_fraction": 0.98,
+  "image_format": "png",
+  "jpeg_quality": 95,
+  "dhr_preset": "default_nonrigid_fast",
+  "dhr_padding_mode": "zeros",
+  "dhr_valid_mask_threshold": 0.999,
+  "dhr_overrides": {
+    "loading_params": {
+      "source_resample_ratio": 0.5,
+      "target_resample_ratio": 0.5
+    },
+    "preprocessing_params": {
+      "initial_resampling": true,
+      "initial_resolution": 2048
+    },
+    "nonrigid_registration_params": {
+      "registration_size": 2048,
+      "num_levels": 7,
+      "used_levels": 7
+    }
+  },
+  "dhr_qc_thresholds": {
+    "max_folding_fraction": null,
+    "max_nonpositive_jacobian_fraction": null,
+    "max_displacement_p95_px": null,
+    "min_jacobian_p01": null
+  },
+  "max_affine_rmse_px": 1000.0,
+  "registration_version": "registration_v0_manual_v2"
+}
