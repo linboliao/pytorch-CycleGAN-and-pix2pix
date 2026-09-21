@@ -77,3 +77,52 @@ Resume semantics:
 DHR topology thresholds currently default to null. The pipeline records
 deformation statistics first so thresholds can be chosen from the empirical
 distribution rather than from an unvalidated hard-coded cutoff.
+
+## registration_v1_auto_component prototype
+
+`registration_v1_auto_component` is a landmark-free coarse-registration
+prototype for slides containing independently displaced tissue blocks or pairs
+with unusable manual landmarks. It does not use manual landmarks to estimate a
+transform.
+
+Pipeline:
+
+    low-resolution WSI tissue masks
+      -> connected components
+      -> merge nearby tissue fragments into block-level components
+      -> HE/IHC component matching by layout/area/aspect
+      -> SIFT descriptor matching on stain-robust CLAHE grayscale
+      -> geometric gating from component layout
+      -> full six-parameter RANSAC affine per component
+      -> confidence gate
+      -> representative 2048 context DHR smoke per medium/high component
+
+Config:
+
+    configs/vsseg/registration_v1_auto_component.json
+
+Prototype command:
+
+    scripts/vsseg/run_registration_v0_manual.sh --help   # v0/v2 pipeline only
+
+For v1 use the DHR environment directly:
+
+    export PYTHONPATH=/NAS3/lbliao/Code-138:/NAS3/lbliao/Code-138/aslide:$PYTHONPATH
+    export LD_LIBRARY_PATH=/usr/local/lib/aslide-lib/lib:$LD_LIBRARY_PATH
+    /data12/jing/anaconda3/envs/DHR/bin/python \
+      scripts/vsseg/registration_v1_auto_component.py \
+      --pair-id PAIR_9CDF1C3DBCCB \
+      --pair-id PAIR_29BF62B53D93 \
+      --dhr-device cuda:0
+
+Derived transforms and machine-readable QC:
+
+    /NAS145/linboliao/Data/VS-Seg/derived/registration_v1_auto_component
+
+Visual review outputs:
+
+    /NAS145/linboliao/Data/VS-Seg/reports/dataset_audit/registration_v1_auto_component
+
+The current prototype intentionally stops before full dataset materialization.
+Component transforms must first pass visual/quantitative review before being
+promoted into a complete patch planner/materializer.
