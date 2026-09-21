@@ -1,8 +1,8 @@
 {
-  "registration_version": "registration_v1_1_structure_component",
+  "registration_version": "registration_v1_component",
   "inventory": "/NAS145/linboliao/Data/VS-Seg/derived/registration_v0_manual_v2/private/manual_pair_inventory_internal.csv",
-  "output_root": "/NAS145/linboliao/Data/VS-Seg/derived/registration_v1_1_structure_component",
-  "report_root": "/NAS145/linboliao/Data/VS-Seg/reports/dataset_audit/registration_v1_1_structure_component",
+  "output_root": "/NAS145/linboliao/Data/VS-Seg/derived/registration_v1_component",
+  "report_root": "/NAS145/linboliao/Data/VS-Seg/reports/dataset_audit/registration_v1_component",
   "aslide_root": "/NAS3/lbliao/Code-138/aslide",
   "dhr_root": "/NAS3/lbliao/Code-138/DeeperHistReg",
   "min_component_canvas_fraction": 0.002,
@@ -19,12 +19,9 @@
   "mi_sampling_fraction": 0.2,
   "candidate_min_mask_dice": 0.68,
   "candidate_max_boundary_fraction": 0.08,
-  "context_size": 2048,
-  "patch_size": 1024,
-  "affine_margin": 192,
   "dhr_preset": "default_nonrigid_fast",
   "dhr_device": "cuda:0",
-  "dhr_tmp_root": "/tmp/vsseg_dhr_structure_component",
+  "dhr_tmp_root": "/tmp/vsseg_dhr_registration_v1",
   "dhr_overrides": {
     "loading_params": {
       "source_resample_ratio": 0.5,
@@ -44,5 +41,19 @@
   "mi_top_k": 2,
   "mi_max_side": 1152,
   "component_crop_max_side": 1800,
-  "component_crop_margin_fraction": 0.18
+  "component_crop_margin_fraction": 0.18,
+  "kfb_integrity_min_level": 2,
+  "kfb_integrity_grid_fractions": [
+    0.2,
+    0.5,
+    0.8
+  ],
+  "kfb_integrity_fov_level0": 2048,
+  "kfb_integrity_compare_size": 128,
+  "kfb_integrity_min_gray_corr": 0.65,
+  "kfb_integrity_min_edge_corr": 0.6,
+  "kfb_integrity_min_mask_iou": 0.55,
+  "kfb_integrity_min_ok_samples": 5,
+  "dhr_review_canvas_size": 1024,
+  "dhr_review_working_size": 2048
 }

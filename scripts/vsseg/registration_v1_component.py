@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""Structure-first, landmark-free component registration prototype.
+"""VS-Seg registration v1: component-aware, structure-first registration.
 
-This is a successor to registration_v1_auto_component. Sparse SIFT matches are
-kept only as one candidate source. A candidate must survive tissue-shape
-refinement and multimodal structural scoring before it can reach DHR.
+Manual landmarks are not used to estimate transforms. Tissue blocks are matched
+independently; SIFT is one candidate source only; structure/shape metrics decide
+coarse acceptance. KFB pyramid integrity is checked before registration.
 """
 
 import argparse
-import contextlib
-import io
 import csv
 import json
 import math
@@ -23,7 +21,7 @@ import numpy as np
 import SimpleITK as sitk
 from PIL import Image
 
-import registration_v1_auto_component as base
+import registration_utils as utils
 
 
 SCHEMA_VERSION = 1
@@ -38,7 +36,7 @@ def choose_registration_view(slide, max_side):
     else:
         level = max(range(len(dims)), key=lambda i: max(dims[i]))
     width, height = dims[level]
-    image = base.rgb_array(slide.read_region((0, 0), level, (width, height)))
+    image = utils.rgb_array(slide.read_region((0, 0), level, (width, height)))
     if max(width, height) > max_side:
         scale = float(max_side) / max(width, height)
         new_size = (
@@ -131,90 +129,239 @@ def backend_location_from_level0(slide, location_level0, level):
     x0, y0 = map(float, location_level0)
     if slide_uses_level_coordinates(slide) and int(level) > 0:
         downsample = float(slide.level_downsamples[level])
-        return (
-            int(round(x0 / downsample)),
-            int(round(y0 / downsample)),
-        )
+        return int(round(x0 / downsample)), int(round(y0 / downsample))
     return int(round(x0)), int(round(y0))
 
 
-def fixed_tile_location(slide, location_level0, level, x_level, y_level):
-    base_location = backend_location_from_level0(slide, location_level0, level)
-    if slide_uses_level_coordinates(slide):
-        return (
-            int(base_location[0] + x_level),
-            int(base_location[1] + y_level),
-        )
+def read_level0_bbox_at_level(slide, bbox_level0, level):
+    """Read one ROI with backend-correct coordinates and no tile fallback."""
+    x0, y0, x1, y1 = map(int, bbox_level0)
     downsample = float(slide.level_downsamples[level])
-    return (
-        int(round(base_location[0] + x_level * downsample)),
-        int(round(base_location[1] + y_level * downsample)),
-    )
+    width = max(1, int(math.ceil((x1 - x0) / downsample)))
+    height = max(1, int(math.ceil((y1 - y0) / downsample)))
+    location = backend_location_from_level0(slide, (x0, y0), level)
+    image = utils.rgb_array(slide.read_region(location, level, (width, height)))
+    return image, {
+        "level": int(level),
+        "downsample": downsample,
+        "backend_location": [int(location[0]), int(location[1])],
+        "requested_size": [width, height],
+    }
 
 
-def read_region_resilient(slide, location_level0, level, size_level):
-    backend_location = backend_location_from_level0(
-        slide, location_level0, level
-    )
-    try:
-        return base.rgb_array(
-            slide.read_region(backend_location, level, size_level)
+def _corrcoef(a, b):
+    a = np.asarray(a, dtype=np.float32).reshape(-1)
+    b = np.asarray(b, dtype=np.float32).reshape(-1)
+    if a.size < 16 or b.size != a.size or a.std() < 1e-6 or b.std() < 1e-6:
+        return 0.0
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def _edge_magnitude(rgb):
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    return cv2.magnitude(gx, gy)
+
+
+def _integrity_pair_metrics(candidate, reference):
+    size = (reference.shape[1], reference.shape[0])
+    if candidate.shape[:2] != reference.shape[:2]:
+        candidate = cv2.resize(candidate, size, interpolation=cv2.INTER_AREA)
+    cgray = cv2.cvtColor(candidate, cv2.COLOR_RGB2GRAY)
+    rgray = cv2.cvtColor(reference, cv2.COLOR_RGB2GRAY)
+    cmask = utils.tissue_mask(candidate) > 0
+    rmask = utils.tissue_mask(reference) > 0
+    union = np.logical_or(cmask, rmask).sum()
+    intersection = np.logical_and(cmask, rmask).sum()
+    return {
+        "gray_corr": _corrcoef(cgray, rgray),
+        "edge_corr": _corrcoef(_edge_magnitude(candidate), _edge_magnitude(reference)),
+        "mask_iou": float(intersection / max(1, union)),
+        "gray_mae": float(np.abs(cgray.astype(np.float32) - rgray.astype(np.float32)).mean()),
+    }
+
+
+def integrity_summary_passes(summary, args):
+    return bool(
+        summary["n_ok"] >= int(args.kfb_integrity_min_ok_samples)
+        and summary["median_edge_corr"] >= float(args.kfb_integrity_min_edge_corr)
+        and (
+            summary["median_gray_corr"] >= float(args.kfb_integrity_min_gray_corr)
+            or summary["median_mask_iou"] >= float(args.kfb_integrity_min_mask_iou)
         )
-    except Exception as roi_error:
-        if not hasattr(slide, "read_fixed_region"):
-            raise
-        width, height = map(int, size_level)
-        canvas = np.full((height, width, 3), 255, dtype=np.uint8)
-        tile_size = 256
+    )
+
+
+def evaluate_kfb_pyramid_integrity(slide, bbox_level0, args):
+    """Compare small fields across KFB levels against the coarsest reference."""
+    if not slide_uses_level_coordinates(slide):
+        return {"mode": "standard", "levels": []}
+    level_count = len(slide.level_downsamples)
+    min_level = min(max(1, int(args.kfb_integrity_min_level)), level_count - 1)
+    levels = list(range(min_level, level_count))
+    reference_level = levels[-1]
+    x0, y0, x1, y1 = map(float, bbox_level0)
+    width0 = max(1.0, x1 - x0)
+    height0 = max(1.0, y1 - y0)
+    fractions = list(args.kfb_integrity_grid_fractions)
+    centers = [
+        (x0 + fx * width0, y0 + fy * height0)
+        for fy in fractions for fx in fractions
+    ]
+    fov0 = float(args.kfb_integrity_fov_level0)
+    compare_side = int(args.kfb_integrity_compare_size)
+    samples = []
+    for sample_id, (cx, cy) in enumerate(centers):
+        half = fov0 / 2.0
+        sample_bbox = [
+            max(0, int(round(cx - half))),
+            max(0, int(round(cy - half))),
+            min(int(slide.dimensions[0]), int(round(cx + half))),
+            min(int(slide.dimensions[1]), int(round(cy + half))),
+        ]
         try:
-            for y in range(0, height, tile_size):
-                for x in range(0, width, tile_size):
-                    loc = fixed_tile_location(
-                        slide, location_level0, level, x, y
-                    )
-                    with contextlib.redirect_stdout(io.StringIO()):
-                        tile = base.rgb_array(
-                            slide.read_fixed_region(
-                                loc, level, (tile_size, tile_size)
-                            )
-                        )
-                    copy_h = min(tile.shape[0], height - y)
-                    copy_w = min(tile.shape[1], width - x)
-                    canvas[y:y+copy_h, x:x+copy_w] = tile[:copy_h, :copy_w]
-            return canvas
+            ref, _ = read_level0_bbox_at_level(slide, sample_bbox, reference_level)
+            ref = cv2.resize(ref, (compare_side, compare_side), interpolation=cv2.INTER_AREA)
         except Exception:
-            raise roi_error
+            continue
+        for level in levels:
+            try:
+                image, _ = read_level0_bbox_at_level(slide, sample_bbox, level)
+                image = cv2.resize(image, (compare_side, compare_side), interpolation=cv2.INTER_AREA)
+                metrics = _integrity_pair_metrics(image, ref)
+                samples.append({"sample": sample_id, "level": level, "ok": True, **metrics})
+            except Exception:
+                samples.append({
+                    "sample": sample_id, "level": level, "ok": False,
+                    "gray_corr": 0.0, "edge_corr": 0.0,
+                    "mask_iou": 0.0, "gray_mae": 255.0,
+                })
+    summaries = []
+    for level in levels:
+        values = [item for item in samples if item["level"] == level and item["ok"]]
+        if values:
+            summary = {
+                "level": level,
+                "downsample": float(slide.level_downsamples[level]),
+                "n_ok": len(values),
+                "median_gray_corr": float(np.median([v["gray_corr"] for v in values])),
+                "median_edge_corr": float(np.median([v["edge_corr"] for v in values])),
+                "median_mask_iou": float(np.median([v["mask_iou"] for v in values])),
+                "median_gray_mae": float(np.median([v["gray_mae"] for v in values])),
+            }
+        else:
+            summary = {
+                "level": level,
+                "downsample": float(slide.level_downsamples[level]),
+                "n_ok": 0,
+                "median_gray_corr": 0.0,
+                "median_edge_corr": 0.0,
+                "median_mask_iou": 0.0,
+                "median_gray_mae": 255.0,
+            }
+        summary["passed"] = True if level == reference_level else integrity_summary_passes(summary, args)
+        summaries.append(summary)
+    selected = next((item for item in summaries if item["passed"]), summaries[-1])
+    return {
+        "mode": "kfb_cross_level",
+        "reference_level": reference_level,
+        "selected_level": int(selected["level"]),
+        "selected_downsample": float(selected["downsample"]),
+        "levels": summaries,
+    }
 
 
-def read_component_crop(slide, bbox_level0, max_side):
-    x0, y0, x1, y1 = bbox_level0
+def choose_level_for_size(slide, bbox_level0, max_side):
+    x0, y0, x1, y1 = map(int, bbox_level0)
     width0 = max(1, x1 - x0)
     height0 = max(1, y1 - y0)
     choices = []
     for level, downsample in enumerate(slide.level_downsamples):
-        w = int(math.ceil(width0 / float(downsample)))
-        h = int(math.ceil(height0 / float(downsample)))
-        choices.append((level, float(downsample), w, h, max(w, h)))
-    above = [item for item in choices if item[4] >= max_side]
-    selected = min(above, key=lambda item: item[4]) if above else max(choices, key=lambda item: item[4])
-    level, downsample, width, height, _ = selected
-    crop = read_region_resilient(slide, (x0, y0), level, (width, height))
-    if max(width, height) > max_side:
-        factor = float(max_side) / max(width, height)
-        new_w = max(64, int(round(width * factor)))
-        new_h = max(64, int(round(height * factor)))
-        crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        width = int(math.ceil(width0 / float(downsample)))
+        height = int(math.ceil(height0 / float(downsample)))
+        choices.append((level, float(downsample), max(width, height)))
+    above = [item for item in choices if item[2] >= max_side]
+    return min(above, key=lambda item: item[2])[0] if above else max(choices, key=lambda item: item[2])[0]
+
+
+def _nearest_level_for_downsample(slide, target_downsample, allowed_levels=None):
+    levels = list(range(len(slide.level_downsamples))) if allowed_levels is None else list(allowed_levels)
+    if not levels:
+        raise ValueError("No pyramid level available")
+    at_or_coarser = [
+        level for level in levels
+        if float(slide.level_downsamples[level]) >= float(target_downsample)
+    ]
+    candidates = at_or_coarser or levels
+    return min(
+        candidates,
+        key=lambda level: abs(math.log(
+            max(1e-6, float(slide.level_downsamples[level]) / float(target_downsample))
+        )),
+    )
+
+
+def select_component_read_levels(he_slide, ihc_slide, he_bbox0, ihc_bbox0, args):
+    he_qc = evaluate_kfb_pyramid_integrity(he_slide, he_bbox0, args)
+    ihc_qc = evaluate_kfb_pyramid_integrity(ihc_slide, ihc_bbox0, args)
+    if he_qc["mode"] == "kfb_cross_level":
+        he_initial = int(he_qc["selected_level"])
+    else:
+        he_initial = choose_level_for_size(he_slide, he_bbox0, args.component_crop_max_side)
+    if ihc_qc["mode"] == "kfb_cross_level":
+        ihc_initial = int(ihc_qc["selected_level"])
+    else:
+        ihc_initial = choose_level_for_size(ihc_slide, ihc_bbox0, args.component_crop_max_side)
+    target_downsample = max(
+        float(he_slide.level_downsamples[he_initial]),
+        float(ihc_slide.level_downsamples[ihc_initial]),
+    )
+    if he_qc["mode"] == "kfb_cross_level":
+        he_allowed = [item["level"] for item in he_qc["levels"] if item["passed"]]
+    else:
+        he_allowed = None
+    if ihc_qc["mode"] == "kfb_cross_level":
+        ihc_allowed = [item["level"] for item in ihc_qc["levels"] if item["passed"]]
+    else:
+        ihc_allowed = None
+    he_level = _nearest_level_for_downsample(he_slide, target_downsample, he_allowed)
+    ihc_level = _nearest_level_for_downsample(ihc_slide, target_downsample, ihc_allowed)
+    return he_level, ihc_level, {
+        "common_target_downsample": target_downsample,
+        "he": he_qc,
+        "ihc": ihc_qc,
+        "he_used_level": int(he_level),
+        "ihc_used_level": int(ihc_level),
+        "he_used_downsample": float(he_slide.level_downsamples[he_level]),
+        "ihc_used_downsample": float(ihc_slide.level_downsamples[ihc_level]),
+    }
+
+
+def read_component_crop_at_level(slide, bbox_level0, level, max_side):
+    crop, read_meta = read_level0_bbox_at_level(slide, bbox_level0, level)
+    x0, y0, x1, y1 = map(int, bbox_level0)
+    width0 = max(1, x1 - x0)
+    height0 = max(1, y1 - y0)
+    if max(crop.shape[:2]) > max_side:
+        factor = float(max_side) / max(crop.shape[:2])
+        crop = cv2.resize(
+            crop,
+            (max(64, int(round(crop.shape[1] * factor))),
+             max(64, int(round(crop.shape[0] * factor)))),
+            interpolation=cv2.INTER_AREA,
+        )
     scale_x = crop.shape[1] / float(width0)
     scale_y = crop.shape[0] / float(height0)
-    return crop, [x0, y0], scale_x, scale_y
+    return crop, [x0, y0], scale_x, scale_y, read_meta
 
 
 def component_from_local_tissue(rgb):
-    mask = base.tissue_mask(rgb)
-    components = base.extract_components(mask, 0.001, 0.01)
+    mask = utils.tissue_mask(rgb)
+    components = utils.extract_components(mask, 0.001, 0.01)
     if not components:
         raise ValueError("No tissue component found inside component crop")
-    components = base.merge_nearby_components(components, rgb.shape, 0.04)
+    components = utils.merge_nearby_components(components, rgb.shape, 0.04)
     keep = [component for component in components if component["area_fraction_tissue"] >= 0.05]
     if not keep:
         keep = [components[0]]
@@ -373,8 +520,8 @@ def similarity_matrix_from_sitk(transform):
 
 
 def multimodal_mi_refine(he_rgb, ihc_rgb, he_component, ihc_component, candidate, args):
-    fixed_gray_full = base.clahe_gray(he_rgb, invert=False)
-    moving_gray_full = base.clahe_gray(ihc_rgb, invert=False)
+    fixed_gray_full = utils.clahe_gray(he_rgb, invert=False)
+    moving_gray_full = utils.clahe_gray(ihc_rgb, invert=False)
     roi = crop_bbox(he_component, fixed_gray_full.shape, pad_fraction=0.25)
     x0, y0, x1, y1 = roi
     fixed_crop = fixed_gray_full[y0:y1, x0:x1]
@@ -516,8 +663,8 @@ def score_candidate(he_rgb, ihc_rgb, he_component, ihc_component, matrix):
     boundary_fraction = boundary_median / max(1.0, diagonal)
     boundary_score = math.exp(-boundary_fraction / 0.025)
 
-    he_gray_full = base.clahe_gray(he_rgb, invert=False)
-    ihc_gray_full = base.clahe_gray(ihc_rgb, invert=False)
+    he_gray_full = utils.clahe_gray(he_rgb, invert=False)
+    ihc_gray_full = utils.clahe_gray(ihc_rgb, invert=False)
     he_gray = he_gray_full[y0:y1, x0:x1]
     warped_gray = warp_roi_to_he(
         ihc_gray_full, matrix, roi, cv2.INTER_LINEAR, 255
@@ -553,10 +700,10 @@ def affine_plausible(matrix):
 
 
 def candidate_pipeline(he_rgb, ihc_rgb, he_component, ihc_component, args):
-    raw = [("bbox", base.bbox_initial_affine(he_component, ihc_component))]
+    raw = [("bbox", utils.bbox_initial_affine(he_component, ihc_component))]
     for index, matrix in enumerate(pca_affine_candidates(he_component, ihc_component)):
         raw.append(("pca_%d" % index, matrix))
-    sift_result = base.sift_matches(he_rgb, ihc_rgb, he_component, ihc_component, args)
+    sift_result = utils.sift_matches(he_rgb, ihc_rgb, he_component, ihc_component, args)
     if sift_result is not None:
         raw.append(("sift_ransac", sift_result["matrix"]))
 
@@ -636,7 +783,7 @@ def write_candidate_csv(path, candidates):
     rows = []
     for rank, candidate in enumerate(candidates, 1):
         rows.append({"rank": rank, **candidate})
-    base.write_csv_atomic(path, rows, fields)
+    utils.write_csv_atomic(path, rows, fields)
 
 
 def final_overlay(he_rgb, ihc_rgb, he_component, candidate, component_id):
@@ -649,10 +796,10 @@ def final_overlay(he_rgb, ihc_rgb, he_component, candidate, component_id):
     )
     overlay = cv2.addWeighted(he_rgb, 0.5, warped, 0.5, 0)
     x0,y0,x1,y1 = crop_bbox(he_component, he_rgb.shape[:2], 0.15)
-    panel = base.hstack([
+    panel = utils.hstack([
         he_rgb[y0:y1,x0:x1], warped[y0:y1,x0:x1], overlay[y0:y1,x0:x1]
     ])
-    return base.add_header(panel, [
+    return utils.add_header(panel, [
         "component %d: HE | selected structural affine IHC | overlay" % component_id,
         "%s score=%.4f dice=%.3f boundary=%.3f%% NMI=%.3f grad=%.3f" % (
             candidate["name"], candidate["score"], candidate["mask_dice"],
@@ -660,6 +807,17 @@ def final_overlay(he_rgb, ihc_rgb, he_component, candidate, component_id):
             candidate["gradient_correlation"],
         ),
     ])
+
+
+def _integrity_rows(role, read_qc):
+    qc = read_qc[role]
+    if qc["mode"] != "kfb_cross_level":
+        return [{
+            "role": role, "mode": qc["mode"], "level": "", "downsample": "",
+            "n_ok": "", "median_gray_corr": "", "median_edge_corr": "",
+            "median_mask_iou": "", "median_gray_mae": "", "passed": "",
+        }]
+    return [{"role": role, "mode": qc["mode"], **item} for item in qc["levels"]]
 
 
 def process_pair(row, args, Aslide):
@@ -671,37 +829,37 @@ def process_pair(row, args, Aslide):
     he_slide = Aslide(row["he_wsi_path"])
     ihc_slide = Aslide(row["ihc_wsi_path"])
     try:
-        he_detect, he_detect_sx, he_detect_sy = base.choose_thumbnail(
+        he_detect, he_detect_sx, he_detect_sy = utils.choose_thumbnail(
             he_slide, args.component_detection_max_side
         )
-        ihc_detect, ihc_detect_sx, ihc_detect_sy = base.choose_thumbnail(
+        ihc_detect, ihc_detect_sx, ihc_detect_sy = utils.choose_thumbnail(
             ihc_slide, args.component_detection_max_side
         )
-        he_components = base.extract_components(
-            base.tissue_mask(he_detect), args.min_component_canvas_fraction,
+        he_components = utils.extract_components(
+            utils.tissue_mask(he_detect), args.min_component_canvas_fraction,
             args.min_component_tissue_fraction
         )
-        ihc_components = base.extract_components(
-            base.tissue_mask(ihc_detect), args.min_component_canvas_fraction,
+        ihc_components = utils.extract_components(
+            utils.tissue_mask(ihc_detect), args.min_component_canvas_fraction,
             args.min_component_tissue_fraction
         )
-        he_components = base.merge_nearby_components(
+        he_components = utils.merge_nearby_components(
             he_components, he_detect.shape, args.component_merge_gap_fraction
         )
-        ihc_components = base.merge_nearby_components(
+        ihc_components = utils.merge_nearby_components(
             ihc_components, ihc_detect.shape, args.component_merge_gap_fraction
         )
-        matches, unmatched_he, unmatched_ihc = base.match_components(
+        matches, unmatched_he, unmatched_ihc = utils.match_components(
             he_components, ihc_components, he_detect.shape, ihc_detect.shape,
             args.component_match_max_cost
         )
-        overview = base.hstack([
-            base.draw_components(he_detect, he_components, "HE components"),
-            base.draw_components(ihc_detect, ihc_components, "IHC components"),
+        overview = utils.hstack([
+            utils.draw_components(he_detect, he_components, "HE components"),
+            utils.draw_components(ihc_detect, ihc_components, "IHC components"),
         ])
-        overview = base.add_header(overview, [
+        overview = utils.add_header(overview, [
             pair_id,
-            "v1.1 component detection only; matched blocks=%d" % len(matches),
+            "registration v1 component detection; matched blocks=%d" % len(matches),
         ])
         Image.fromarray(overview).save(report_dir / "01_component_overview.png")
 
@@ -724,11 +882,22 @@ def process_pair(row, args, Aslide):
                 ihc_components[ii], ihc_detect_sx, ihc_detect_sy,
                 ihc_slide.dimensions, args.component_crop_margin_fraction
             )
-            he_crop, he_origin, he_sx, he_sy = read_component_crop(
-                he_slide, he_bbox0, args.component_crop_max_side
+            he_level, ihc_level, read_qc = select_component_read_levels(
+                he_slide, ihc_slide, he_bbox0, ihc_bbox0, args
             )
-            ihc_crop, ihc_origin, ihc_sx, ihc_sy = read_component_crop(
-                ihc_slide, ihc_bbox0, args.component_crop_max_side
+            integrity_rows = _integrity_rows("he", read_qc) + _integrity_rows("ihc", read_qc)
+            utils.write_csv_atomic(
+                report_dir / ("02_component_%02d_read_integrity.csv" % component_id),
+                integrity_rows,
+                ["role", "mode", "level", "downsample", "n_ok",
+                 "median_gray_corr", "median_edge_corr", "median_mask_iou",
+                 "median_gray_mae", "passed"],
+            )
+            he_crop, he_origin, he_sx, he_sy, he_read = read_component_crop_at_level(
+                he_slide, he_bbox0, he_level, args.component_crop_max_side
+            )
+            ihc_crop, ihc_origin, ihc_sx, ihc_sy, ihc_read = read_component_crop_at_level(
+                ihc_slide, ihc_bbox0, ihc_level, args.component_crop_max_side
             )
             he_component = component_from_local_tissue(he_crop)
             ihc_component = component_from_local_tissue(ihc_crop)
@@ -740,34 +909,31 @@ def process_pair(row, args, Aslide):
             second = candidates[1] if len(candidates) > 1 else None
             confidence = candidate_confidence(best, second, args)
             write_candidate_csv(
-                report_dir / ("02_component_%02d_candidates.csv" % component_id),
+                report_dir / ("03_component_%02d_candidates.csv" % component_id),
                 candidates,
             )
             if sift_result is not None:
-                Image.fromarray(base.feature_visual(
+                Image.fromarray(utils.feature_visual(
                     he_crop, ihc_crop, sift_result, component_id
-                )).save(report_dir / ("02_component_%02d_sift_candidate.png" % component_id))
+                )).save(report_dir / ("03_component_%02d_sift_candidate.png" % component_id))
 
             dhr_info = None
             matrix_level0 = None
             if best is not None:
                 Image.fromarray(final_overlay(
                     he_crop, ihc_crop, he_component, best, component_id
-                )).save(report_dir / ("03_component_%02d_selected_overlay.png" % component_id))
+                )).save(report_dir / ("04_component_%02d_structure_affine.png" % component_id))
                 matrix_level0 = local_affine_to_level0(
                     best["matrix"], he_origin, he_sx, he_sy,
                     ihc_origin, ihc_sx, ihc_sy
                 )
                 if args.run_dhr and confidence in {"high", "medium"}:
-                    anchor_x, anchor_y = base.component_anchor(he_component)
-                    center0 = local_point_to_level0(
-                        anchor_x, anchor_y, he_origin, he_sx, he_sy
-                    )
-                    montage, dhr_info = dhr_smoke_at_center(
-                        he_slide, ihc_slide, center0, matrix_level0, args
+                    montage, dhr_info = dhr_review_trusted_arrays(
+                        he_crop, ihc_crop, best["matrix"], args,
+                        he_level=he_level, ihc_level=ihc_level,
                     )
                     Image.fromarray(montage).save(
-                        report_dir / ("04_component_%02d_dhr_smoke.png" % component_id)
+                        report_dir / ("05_component_%02d_dhr_review.png" % component_id)
                     )
 
             payload = {
@@ -779,6 +945,9 @@ def process_pair(row, args, Aslide):
                 "component_match_cost": component_cost,
                 "he_component_bbox_level0": he_bbox0,
                 "ihc_component_bbox_level0": ihc_bbox0,
+                "read_qc": read_qc,
+                "he_read": he_read,
+                "ihc_read": ihc_read,
                 "confidence": confidence,
                 "manual_landmarks_used_for_transform": False,
                 "selected_candidate": None if best is None else serializable_candidate(best),
@@ -792,9 +961,9 @@ def process_pair(row, args, Aslide):
                         "spatial_coverage",
                     ]
                 },
-                "dhr_smoke": dhr_info,
+                "dhr_review": dhr_info,
             }
-            base.write_json_atomic(
+            utils.write_json_atomic(
                 transform_dir / ("component_%02d.json" % component_id), payload
             )
             pair_summary["components"].append(payload)
@@ -804,6 +973,10 @@ def process_pair(row, args, Aslide):
                 "he_component_id": hi,
                 "ihc_component_id": ii,
                 "component_match_cost": component_cost,
+                "he_read_level": he_level,
+                "ihc_read_level": ihc_level,
+                "he_read_downsample": float(he_slide.level_downsamples[he_level]),
+                "ihc_read_downsample": float(ihc_slide.level_downsamples[ihc_level]),
                 "confidence": confidence,
                 "selected_candidate": "" if best is None else best["name"],
                 "score": "" if best is None else best["score"],
@@ -811,63 +984,83 @@ def process_pair(row, args, Aslide):
                 "boundary_fraction": "" if best is None else best["boundary_fraction"],
                 "nmi": "" if best is None else best["nmi"],
                 "gradient_correlation": "" if best is None else best["gradient_correlation"],
-                "dhr_status": "run" if dhr_info else "not_run",
-                "dhr_valid_fraction": "" if not dhr_info else dhr_info["final_patch_valid_fraction"],
+                "dhr_review_status": "run" if dhr_info else "not_run",
                 "dhr_folding_fraction": "" if not dhr_info else dhr_info["dhr_qc"]["folding_fraction"],
                 "dhr_displacement_p95_px": "" if not dhr_info else dhr_info["dhr_qc"]["displacement_p95_px"],
             })
-        base.write_json_atomic(report_dir / "review_summary.json", pair_summary)
-        base.write_csv_atomic(
+        utils.write_json_atomic(report_dir / "review_summary.json", pair_summary)
+        utils.write_csv_atomic(
             report_dir / "component_summary.csv", rows,
             list(rows[0].keys()) if rows else ["pair_id"]
         )
         return pair_summary, rows
     finally:
-        base.close_slide(he_slide)
-        base.close_slide(ihc_slide)
+        utils.close_slide(he_slide)
+        utils.close_slide(ihc_slide)
 
 
-def dhr_smoke_at_center(he_slide, ihc_slide, center_level0, matrix_level0, args):
-    matrix_level0 = np.asarray(matrix_level0, dtype=np.float64)
-    center_x = int(round(center_level0[0]))
-    center_y = int(round(center_level0[1]))
-    context = args.context_size
-    patch = args.patch_size
-    x0 = int(round(center_x - context / 2))
-    y0 = int(round(center_y - context / 2))
-    he_context, he_valid = base.read_padded(he_slide, x0, y0, context, context)
-    ihc_affine, ihc_valid = base.warp_ihc_affine(
-        ihc_slide, matrix_level0, x0, y0, context, args.affine_margin
+def dhr_review_trusted_arrays(he_rgb, ihc_rgb, matrix_he_to_ihc, args, he_level, ihc_level):
+    affine = warp_to_he(
+        ihc_rgb, matrix_he_to_ihc, he_rgb.shape[:2],
+        cv2.INTER_LINEAR, (255, 255, 255)
     )
-    register = base.import_dhr(args.dhr_root)
+    valid = warp_to_he(
+        np.ones(ihc_rgb.shape[:2], dtype=np.uint8),
+        matrix_he_to_ihc, he_rgb.shape[:2], cv2.INTER_NEAREST, 0
+    )
+    canvas_size = int(args.dhr_review_canvas_size)
+    scale = min(1.0, canvas_size / float(max(he_rgb.shape[:2])))
+    scaled_w = max(1, int(round(he_rgb.shape[1] * scale)))
+    scaled_h = max(1, int(round(he_rgb.shape[0] * scale)))
+    he_scaled = cv2.resize(he_rgb, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
+    affine_scaled = cv2.resize(affine, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
+    valid_scaled = cv2.resize(valid, (scaled_w, scaled_h), interpolation=cv2.INTER_NEAREST)
+    he_canvas = np.full((canvas_size, canvas_size, 3), 255, dtype=np.uint8)
+    affine_canvas = he_canvas.copy()
+    valid_canvas = np.zeros((canvas_size, canvas_size), dtype=np.uint8)
+    x0 = (canvas_size - scaled_w) // 2
+    y0 = (canvas_size - scaled_h) // 2
+    he_canvas[y0:y0+scaled_h, x0:x0+scaled_w] = he_scaled
+    affine_canvas[y0:y0+scaled_h, x0:x0+scaled_w] = affine_scaled
+    valid_canvas[y0:y0+scaled_h, x0:x0+scaled_w] = valid_scaled
+
+    working_size = int(args.dhr_review_working_size)
+    he_working = cv2.resize(he_canvas, (working_size, working_size), interpolation=cv2.INTER_LINEAR)
+    affine_working = cv2.resize(affine_canvas, (working_size, working_size), interpolation=cv2.INTER_LINEAR)
+    valid_working = cv2.resize(valid_canvas, (working_size, working_size), interpolation=cv2.INTER_NEAREST)
+    register = utils.import_dhr(args.dhr_root)
     Path(args.dhr_tmp_root).mkdir(parents=True, exist_ok=True)
-    warped, meta = register(
-        ihc_affine,
-        he_context,
+    warped_working, meta = register(
+        affine_working,
+        he_working,
         preset=args.dhr_preset,
         device=args.dhr_device,
         overrides=args.dhr_overrides,
-        source_valid_mask=ihc_valid,
+        source_valid_mask=valid_working,
         temporary_root=args.dhr_tmp_root,
         return_valid_mask=True,
     )
-    he_patch = base.center_crop(he_context, patch)
-    affine_patch = base.center_crop(ihc_affine, patch)
-    dhr_patch = base.center_crop(warped, patch)
-    valid = base.center_crop(meta["valid_mask"].astype(np.uint8), patch)
-    overlay = cv2.addWeighted(he_patch, 0.5, dhr_patch, 0.5, 0)
-    montage = base.hstack([he_patch, affine_patch, dhr_patch, overlay], gap=8)
-    montage = base.add_header(montage, [
+    warped_canvas = cv2.resize(
+        warped_working, (canvas_size, canvas_size), interpolation=cv2.INTER_AREA
+    )
+    warped_scaled = warped_canvas[y0:y0+scaled_h, x0:x0+scaled_w]
+    if scale != 1.0:
+        warped = cv2.resize(
+            warped_scaled, (he_rgb.shape[1], he_rgb.shape[0]), interpolation=cv2.INTER_LINEAR
+        )
+    else:
+        warped = warped_scaled
+    overlay = cv2.addWeighted(he_rgb, 0.5, warped, 0.5, 0)
+    montage = utils.hstack([he_rgb, affine, warped, overlay], gap=8)
+    montage = utils.add_header(montage, [
         "HE | structure-affine IHC | DHR IHC | HE/DHR overlay",
-        "center=(%d,%d) valid=%.4f fold=%.6f disp_p95=%.2f px" % (
-            center_x, center_y, float(valid.mean()),
-            meta["deformation_qc"]["folding_fraction"],
-            meta["deformation_qc"]["displacement_p95_px"],
-        ),
+        "trusted pyramid levels HE=%d IHC=%d; DHR review only" % (he_level, ihc_level),
     ])
     return montage, {
-        "he_center_level0": [center_x, center_y],
-        "final_patch_valid_fraction": float(valid.mean()),
+        "review_only": True,
+        "he_read_level": int(he_level),
+        "ihc_read_level": int(ihc_level),
+        "input_scale_to_review_canvas": float(scale),
         "dhr_registration_time_seconds": meta["registration_time_seconds"],
         "dhr_working_displacement_shape": meta["working_displacement_shape"],
         "dhr_qc": meta["deformation_qc"],
@@ -879,7 +1072,7 @@ def load_config(path):
 
 
 def build_parser():
-    default = Path(__file__).resolve().parents[2] / "configs" / "vsseg" / "registration_v1_1_structure_component.json"
+    default = Path(__file__).resolve().parents[2] / "configs" / "vsseg" / "registration_v1_component.json"
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config", default=str(default))
     pre_args, _ = pre.parse_known_args()
@@ -891,6 +1084,15 @@ def build_parser():
     parser.add_argument("--component-detection-max-side", type=int, default=config["component_detection_max_side"])
     parser.add_argument("--component-crop-max-side", type=int, default=config["component_crop_max_side"])
     parser.add_argument("--component-crop-margin-fraction", type=float, default=config["component_crop_margin_fraction"])
+    parser.add_argument("--kfb-integrity-min-level", type=int, default=config["kfb_integrity_min_level"])
+    parser.add_argument("--kfb-integrity-fov-level0", type=int, default=config["kfb_integrity_fov_level0"])
+    parser.add_argument("--kfb-integrity-compare-size", type=int, default=config["kfb_integrity_compare_size"])
+    parser.add_argument("--kfb-integrity-min-gray-corr", type=float, default=config["kfb_integrity_min_gray_corr"])
+    parser.add_argument("--kfb-integrity-min-edge-corr", type=float, default=config["kfb_integrity_min_edge_corr"])
+    parser.add_argument("--kfb-integrity-min-mask-iou", type=float, default=config["kfb_integrity_min_mask_iou"])
+    parser.add_argument("--kfb-integrity-min-ok-samples", type=int, default=config["kfb_integrity_min_ok_samples"])
+    parser.add_argument("--dhr-review-canvas-size", type=int, default=config["dhr_review_canvas_size"])
+    parser.add_argument("--dhr-review-working-size", type=int, default=config["dhr_review_working_size"])
     parser.add_argument("--min-component-canvas-fraction", type=float, default=config["min_component_canvas_fraction"])
     parser.add_argument("--min-component-tissue-fraction", type=float, default=config["min_component_tissue_fraction"])
     parser.add_argument("--component-merge-gap-fraction", type=float, default=config["component_merge_gap_fraction"])
@@ -907,21 +1109,21 @@ def build_parser():
     parser.add_argument("--mi-max-side", type=int, default=config["mi_max_side"])
     parser.add_argument("--candidate-min-mask-dice", type=float, default=config["candidate_min_mask_dice"])
     parser.add_argument("--candidate-max-boundary-fraction", type=float, default=config["candidate_max_boundary_fraction"])
-    parser.add_argument("--context-size", type=int, default=config["context_size"])
-    parser.add_argument("--patch-size", type=int, default=config["patch_size"])
-    parser.add_argument("--affine-margin", type=int, default=config["affine_margin"])
     parser.add_argument("--dhr-preset", default=config["dhr_preset"])
     parser.add_argument("--dhr-device", default=config["dhr_device"])
     parser.add_argument("--dhr-tmp-root", default=config["dhr_tmp_root"])
     parser.add_argument("--run-dhr", action=argparse.BooleanOptionalAction, default=True)
-    parser.set_defaults(dhr_overrides=config["dhr_overrides"])
+    parser.set_defaults(
+        dhr_overrides=config["dhr_overrides"],
+        kfb_integrity_grid_fractions=config["kfb_integrity_grid_fractions"],
+    )
     return parser
 
 
 def main():
     args = build_parser().parse_args()
-    inventory = {row["pair_id"]: row for row in base.read_csv(args.inventory)}
-    Aslide = base.import_aslide(args.aslide_root)
+    inventory = {row["pair_id"]: row for row in utils.read_csv(args.inventory)}
+    Aslide = utils.import_aslide(args.aslide_root)
     all_rows = []
     for pair_id in args.pair_id:
         if pair_id not in inventory:
@@ -933,22 +1135,22 @@ def main():
             print(
                 " COMPONENT", row["component_id"], row["confidence"],
                 row["selected_candidate"], "score", row["score"],
-                "dice", row["mask_dice"], "DHR", row["dhr_status"],
+                "dice", row["mask_dice"], "DHR", row["dhr_review_status"],
                 flush=True,
             )
     Path(args.output_root).mkdir(parents=True, exist_ok=True)
     fields = list(all_rows[0].keys()) if all_rows else ["pair_id"]
-    base.write_csv_atomic(Path(args.output_root) / "structure_component_summary.csv", all_rows, fields)
+    utils.write_csv_atomic(Path(args.output_root) / "registration_summary.csv", all_rows, fields)
     provenance = {
         "registration_version": args.registration_version,
-        "pipeline_git_commit": base.git_commit(Path(__file__).resolve().parents[2]),
-        "dhr_git_commit": base.git_commit(args.dhr_root),
-        "script_sha256": base.sha256_file(Path(__file__).resolve()),
-        "config_sha256": base.sha256_file(args.config),
+        "pipeline_git_commit": utils.git_commit(Path(__file__).resolve().parents[2]),
+        "dhr_git_commit": utils.git_commit(args.dhr_root),
+        "script_sha256": utils.sha256_file(Path(__file__).resolve()),
+        "config_sha256": utils.sha256_file(args.config),
         "pair_ids": args.pair_id,
         "manual_landmarks_used_for_transform": False,
     }
-    base.write_json_atomic(Path(args.output_root) / "provenance.json", provenance)
+    utils.write_json_atomic(Path(args.output_root) / "provenance.json", provenance)
 
 
 if __name__ == "__main__":

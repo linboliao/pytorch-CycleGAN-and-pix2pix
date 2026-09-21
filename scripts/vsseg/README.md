@@ -76,53 +76,69 @@ Resume semantics:
 
 DHR topology thresholds currently default to null. The pipeline records
 deformation statistics first so thresholds can be chosen from the empirical
-distribution rather than from an unvalidated hard-coded cutoff.
+distribution rather than from an unvalidated hard-coded cutoff.\n\n## registration_v1_component
 
-## registration_v1_auto_component prototype
-
-`registration_v1_auto_component` is a landmark-free coarse-registration
-prototype for slides containing independently displaced tissue blocks or pairs
-with unusable manual landmarks. It does not use manual landmarks to estimate a
-transform.
+registration_v1_component is the active VS-Seg landmark-free registration
+pipeline. It replaces the earlier SIFT-first prototypes.
 
 Pipeline:
 
-    low-resolution WSI tissue masks
-      -> connected components
-      -> merge nearby tissue fragments into block-level components
-      -> HE/IHC component matching by layout/area/aspect
-      -> SIFT descriptor matching on stain-robust CLAHE grayscale
-      -> geometric gating from component layout
-      -> full six-parameter RANSAC affine per component
-      -> confidence gate
-      -> representative 2048 context DHR smoke per medium/high component
+    low-resolution tissue detection
+      -> merge fragments into block-level tissue components
+      -> HE/IHC component matching
+      -> KFB cross-level read-integrity QC
+      -> common trusted pyramid level per component pair
+      -> bbox / PCA-shape / SIFT candidate generation
+      -> signed-distance tissue-shape refinement
+      -> multimodal mutual-information refinement
+      -> candidate scoring by tissue Dice, boundary distance, NMI,
+         and internal gradient correlation
+      -> medium/high confidence gate
+      -> DHR review using only the already-read trusted component arrays
 
-Config:
+Reader rules:
 
-    configs/vsseg/registration_v1_auto_component.json
+- KFB read_region uses coordinates in the selected pyramid level when level > 0;
+  registration v1 converts level-0 coordinates by level_downsample.
+- read_fixed_region is never used by registration v1.
+- suspected KFB corruption is handled by cross-level integrity QC and fallback
+  to the first trusted level, not by tile mosaicing.
+- SIFT is only one candidate source. Match count/inlier ratio cannot by itself
+  promote a registration.
 
-Prototype command:
+Formal files:
 
-    scripts/vsseg/run_registration_v0_manual.sh --help   # v0/v2 pipeline only
+    configs/vsseg/registration_v1_component.json
+    scripts/vsseg/registration_utils.py
+    scripts/vsseg/registration_v1_component.py
+    scripts/vsseg/test_registration_v1_component.py
 
-For v1 use the DHR environment directly:
+Run:
 
-    export PYTHONPATH=/NAS3/lbliao/Code-138:/NAS3/lbliao/Code-138/aslide:$PYTHONPATH
+    export PYTHONPATH=/NAS3/lbliao/Code-138/pytorch-CycleGAN-and-pix2pix/scripts/vsseg:/NAS3/lbliao/Code-138:/NAS3/lbliao/Code-138/aslide:$PYTHONPATH
     export LD_LIBRARY_PATH=/usr/local/lib/aslide-lib/lib:$LD_LIBRARY_PATH
+
     /data12/jing/anaconda3/envs/DHR/bin/python \
-      scripts/vsseg/registration_v1_auto_component.py \
+      scripts/vsseg/registration_v1_component.py \
       --pair-id PAIR_9CDF1C3DBCCB \
-      --pair-id PAIR_29BF62B53D93 \
       --dhr-device cuda:0
 
-Derived transforms and machine-readable QC:
+Formal outputs:
 
-    /NAS145/linboliao/Data/VS-Seg/derived/registration_v1_auto_component
+    /NAS145/linboliao/Data/VS-Seg/derived/registration_v1_component
+    /NAS145/linboliao/Data/VS-Seg/reports/dataset_audit/registration_v1_component
 
-Visual review outputs:
+Per-component reports:
 
-    /NAS145/linboliao/Data/VS-Seg/reports/dataset_audit/registration_v1_auto_component
+    02_component_XX_read_integrity.csv
+    03_component_XX_candidates.csv
+    04_component_XX_structure_affine.png
+    05_component_XX_dhr_review.png
 
-The current prototype intentionally stops before full dataset materialization.
-Component transforms must first pass visual/quantitative review before being
-promoted into a complete patch planner/materializer.
+The DHR image is a trusted-level registration review artifact. High-resolution
+training-patch materialization still requires a separate WSI ROI integrity gate;
+a lower trusted registration level must never be upsampled and presented as a
+real high-magnification training patch.
+
+Retired experimental implementations remain available through Git history and
+are intentionally absent from the active work tree.\n
