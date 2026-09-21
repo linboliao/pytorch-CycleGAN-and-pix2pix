@@ -142,3 +142,40 @@ real high-magnification training patch.
 
 Retired experimental implementations remain available through Git history and
 are intentionally absent from the active work tree.\n
+## registration_v1_component paired patch pilot
+
+The active small-scale materializer is:
+
+    configs/vsseg/patches_registration_v1_pilot.json
+    scripts/vsseg/materialize_registration_v1_patches.py
+    scripts/vsseg/test_materialize_registration_v1_patches.py
+
+Default pilot output:
+
+    /NAS145/linboliao/Data/VS-Seg/derived/patches/
+      registration_v1_component/ps1024_ctx2048/pilot_v0
+
+The planner samples component-aware HE locations from the trusted registration
+level. Materialization always reads the actual level-0 HE context and the actual
+level-0 IHC affine source ROI, then compares each against its component-specific
+trusted pyramid level. A failed integrity check is recorded as
+roi_integrity_rejected and never reaches DHR or the training image tree.
+
+Ready images are stored once, independent of split:
+
+    images/he/<PAIR_ID>/<PATCH_ID>.png
+    images/ihc/<PAIR_ID>/<PATCH_ID>.png
+
+Split membership and all QC/provenance are manifest-driven. Raw WSI paths are
+kept only under manifests/private.
+
+Typical pilot workflow:
+
+    /data12/jing/anaconda3/envs/DHR/bin/python       scripts/vsseg/materialize_registration_v1_patches.py --stage plan
+
+    /data12/jing/anaconda3/envs/DHR/bin/python       scripts/vsseg/materialize_registration_v1_patches.py       --stage materialize --device cuda:0
+
+The canonical manifests/patch_manifest.csv can be passed directly to the
+vsseg_paired Dataset adapter. Do not promote pilot_v0 into the full dataset
+without reviewing the contact sheets and representative per-patch registration
+QC.
