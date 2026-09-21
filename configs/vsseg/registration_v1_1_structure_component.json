@@ -1,0 +1,48 @@
+{
+  "registration_version": "registration_v1_1_structure_component",
+  "inventory": "/NAS145/linboliao/Data/VS-Seg/derived/registration_v0_manual_v2/private/manual_pair_inventory_internal.csv",
+  "output_root": "/NAS145/linboliao/Data/VS-Seg/derived/registration_v1_1_structure_component",
+  "report_root": "/NAS145/linboliao/Data/VS-Seg/reports/dataset_audit/registration_v1_1_structure_component",
+  "aslide_root": "/NAS3/lbliao/Code-138/aslide",
+  "dhr_root": "/NAS3/lbliao/Code-138/DeeperHistReg",
+  "min_component_canvas_fraction": 0.002,
+  "min_component_tissue_fraction": 0.015,
+  "component_merge_gap_fraction": 0.045,
+  "component_match_max_cost": 1.35,
+  "sift_nfeatures": 18000,
+  "sift_ratio": 0.8,
+  "feature_gate_fraction": 0.4,
+  "ransac_threshold_thumbnail_px": 16.0,
+  "shape_ecc_iterations": 250,
+  "shape_ecc_epsilon": 1e-05,
+  "mi_iterations": 120,
+  "mi_sampling_fraction": 0.2,
+  "candidate_min_mask_dice": 0.68,
+  "candidate_max_boundary_fraction": 0.08,
+  "context_size": 2048,
+  "patch_size": 1024,
+  "affine_margin": 192,
+  "dhr_preset": "default_nonrigid_fast",
+  "dhr_device": "cuda:0",
+  "dhr_tmp_root": "/tmp/vsseg_dhr_structure_component",
+  "dhr_overrides": {
+    "loading_params": {
+      "source_resample_ratio": 0.5,
+      "target_resample_ratio": 0.5
+    },
+    "preprocessing_params": {
+      "initial_resampling": true,
+      "initial_resolution": 2048
+    },
+    "nonrigid_registration_params": {
+      "registration_size": 2048,
+      "num_levels": 7,
+      "used_levels": 7
+    }
+  },
+  "component_detection_max_side": 2800,
+  "mi_top_k": 2,
+  "mi_max_side": 1152,
+  "component_crop_max_side": 1800,
+  "component_crop_margin_fraction": 0.18
+}
