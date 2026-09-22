@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "dataset_version": "pilot_v1",
+  "dataset_variant": "ps1024_ctx2048",
+  "registration_version": "registration_v1_component",
+  "project_root": "/NAS145/linboliao/Data/VS-Seg",
+  "registration_root": "/NAS145/linboliao/Data/VS-Seg/derived/registration_v1_component",
+  "output_root": "/NAS145/linboliao/Data/VS-Seg/derived/patches/registration_v1_component/ps1024_ctx2048/pilot_v1",
+  "inventory": "/NAS145/linboliao/Data/VS-Seg/derived/registration_v0_manual_v2/private/manual_pair_inventory_internal.csv",
+  "aslide_root": "/NAS3/lbliao/Code-138/aslide",
+  "dhr_root": "/NAS3/lbliao/Code-138/DeeperHistReg",
+  "pair_ids": [
+    "PAIR_9CDF1C3DBCCB",
+    "PAIR_29BF62B53D93"
+  ],
+  "patch_size": 1024,
+  "context_size": 2048,
+  "stride": 1024,
+  "candidates_per_pair": 32,
+  "min_tissue_fraction": 0.5,
+  "min_valid_fraction": 0.98,
+  "affine_margin": 128,
+  "roi_integrity_min_gray_corr": 0.65,
+  "roi_integrity_min_edge_corr": 0.6,
+  "roi_integrity_min_mask_iou": 0.55,
+  "image_format": "png",
+  "dhr_preset": "default_nonrigid_fast",
+  "dhr_tmp_root": "/tmp/vsseg_dhr_patch_pilot_v0",
+  "dhr_padding_mode": "zeros",
+  "dhr_valid_mask_threshold": 0.999,
+  "dhr_overrides": {
+    "loading_params": {
+      "source_resample_ratio": 0.5,
+      "target_resample_ratio": 0.5
+    },
+    "preprocessing_params": {
+      "initial_resampling": true,
+      "initial_resolution": 2048
+    },
+    "nonrigid_registration_params": {
+      "registration_size": 2048,
+      "num_levels": 7,
+      "used_levels": 7
+    }
+  },
+  "qc_contact_sheet_max_per_pair": 12,
+  "enable_pre_dhr_overlap_gate": true,
+  "pre_dhr_min_affine_tissue_fraction": 0.1,
+  "pre_dhr_min_tissue_ratio": 0.35,
+  "pre_dhr_min_tissue_dice": 0.6,
+  "pre_dhr_max_centroid_distance_norm": 0.2
+}

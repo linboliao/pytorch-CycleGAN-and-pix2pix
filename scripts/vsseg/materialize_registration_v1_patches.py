@@ -70,6 +70,11 @@ PUBLIC_FIELDS = [
     "ihc_roi_edge_corr",
     "ihc_roi_mask_iou",
     "affine_valid_fraction",
+    "pre_dhr_affine_tissue_fraction",
+    "pre_dhr_tissue_ratio",
+    "pre_dhr_tissue_dice",
+    "pre_dhr_tissue_iou",
+    "pre_dhr_centroid_distance_norm",
     "valid_fraction",
     "dhr_registration_time_seconds",
     "dhr_displacement_p95_px",
@@ -546,6 +551,96 @@ def add_text_header(image, lines):
     return np.asarray(pil)
 
 
+def tissue_overlap_metrics(he_rgb, affine_rgb):
+    he_mask = utils.tissue_mask(he_rgb) > 0
+    affine_mask = utils.tissue_mask(affine_rgb) > 0
+    he_tissue = float(he_mask.mean())
+    affine_tissue = float(affine_mask.mean())
+    intersection = int(np.logical_and(he_mask, affine_mask).sum())
+    union = int(np.logical_or(he_mask, affine_mask).sum())
+    dice = float(2.0 * intersection / max(1, int(he_mask.sum()) + int(affine_mask.sum())))
+    iou = float(intersection / max(1, union))
+    ratio = float(affine_tissue / max(1e-8, he_tissue))
+
+    def centroid(mask):
+        ys, xs = np.where(mask)
+        if len(xs) == 0:
+            return None
+        return np.asarray([xs.mean(), ys.mean()], dtype=np.float64)
+
+    he_centroid = centroid(he_mask)
+    affine_centroid = centroid(affine_mask)
+    if he_centroid is None or affine_centroid is None:
+        centroid_distance_norm = 1.0
+    else:
+        diagonal = math.sqrt(float(he_rgb.shape[0] ** 2 + he_rgb.shape[1] ** 2))
+        centroid_distance_norm = float(
+            np.linalg.norm(he_centroid - affine_centroid) / max(1.0, diagonal)
+        )
+    return {
+        "he_tissue_fraction": he_tissue,
+        "affine_tissue_fraction": affine_tissue,
+        "tissue_ratio": ratio,
+        "tissue_dice": dice,
+        "tissue_iou": iou,
+        "centroid_distance_norm": centroid_distance_norm,
+        "he_mask": he_mask,
+        "affine_mask": affine_mask,
+    }
+
+
+def pre_dhr_overlap_passes(metrics, args):
+    return bool(
+        metrics["affine_tissue_fraction"] >= args.pre_dhr_min_affine_tissue_fraction
+        and metrics["tissue_ratio"] >= args.pre_dhr_min_tissue_ratio
+        and metrics["tissue_dice"] >= args.pre_dhr_min_tissue_dice
+        and metrics["centroid_distance_norm"] <= args.pre_dhr_max_centroid_distance_norm
+    )
+
+
+def pre_dhr_rejection_reason(metrics, args):
+    reasons = []
+    if metrics["affine_tissue_fraction"] < args.pre_dhr_min_affine_tissue_fraction:
+        reasons.append("affine_tissue_missing")
+    if metrics["tissue_ratio"] < args.pre_dhr_min_tissue_ratio:
+        reasons.append("affine_tissue_ratio")
+    if metrics["tissue_dice"] < args.pre_dhr_min_tissue_dice:
+        reasons.append("affine_tissue_overlap")
+    if metrics["centroid_distance_norm"] > args.pre_dhr_max_centroid_distance_norm:
+        reasons.append("affine_centroid_offset")
+    return "+".join(reasons) if reasons else ""
+
+
+def pre_dhr_qc_image(he_patch, affine_patch, sample, pair_id, metrics, passed):
+    he_mask = metrics["he_mask"]
+    affine_mask = metrics["affine_mask"]
+    mask_rgb = np.full_like(he_patch, 255)
+    both = np.logical_and(he_mask, affine_mask)
+    he_only = np.logical_and(he_mask, ~affine_mask)
+    affine_only = np.logical_and(affine_mask, ~he_mask)
+    mask_rgb[both] = (150, 150, 150)
+    mask_rgb[he_only] = (80, 80, 80)
+    mask_rgb[affine_only] = (210, 210, 210)
+    overlay = cv2.addWeighted(he_patch, 0.5, affine_patch, 0.5, 0)
+    panel = np.concatenate([he_patch, affine_patch, mask_rgb, overlay], axis=1)
+    state = "PASS" if passed else "REJECT"
+    return add_text_header(
+        panel,
+        [
+            "%s  %s  pre-DHR=%s" % (pair_id, sample, state),
+            "HE | affine IHC | tissue overlap mask | HE/affine 50:50",
+            "aff_tissue=%.3f ratio=%.3f dice=%.3f iou=%.3f centroid=%.3f"
+            % (
+                metrics["affine_tissue_fraction"],
+                metrics["tissue_ratio"],
+                metrics["tissue_dice"],
+                metrics["tissue_iou"],
+                metrics["centroid_distance_norm"],
+            ),
+        ],
+    )
+
+
 def registration_qc_image(he_patch, affine_patch, dhr_patch, sample, pair_id):
     overlay = cv2.addWeighted(he_patch, 0.5, dhr_patch, 0.5, 0)
     panel = np.concatenate([he_patch, affine_patch, dhr_patch, overlay], axis=1)
@@ -613,6 +708,7 @@ def terminal_existing(row):
     return row and row.get("status") in {
         "ready",
         "roi_integrity_rejected",
+        "pre_dhr_affine_rejected",
         "low_tissue",
         "low_valid_fraction",
         "failed",
@@ -818,6 +914,33 @@ def materialize(args):
                         private_by_id[sid] = private
                         continue
 
+                    if args.enable_pre_dhr_overlap_gate:
+                        pre_dhr = tissue_overlap_metrics(he_patch, affine_patch)
+                        public["pre_dhr_affine_tissue_fraction"] = pre_dhr["affine_tissue_fraction"]
+                        public["pre_dhr_tissue_ratio"] = pre_dhr["tissue_ratio"]
+                        public["pre_dhr_tissue_dice"] = pre_dhr["tissue_dice"]
+                        public["pre_dhr_tissue_iou"] = pre_dhr["tissue_iou"]
+                        public["pre_dhr_centroid_distance_norm"] = pre_dhr["centroid_distance_norm"]
+                        pre_dhr_passed = pre_dhr_overlap_passes(pre_dhr, args)
+                        pre_dhr_qc_path = (
+                            output_root / "qc" / "pre_dhr" / pair_id / (sid + ".png")
+                        )
+                        save_png_atomic(
+                            pre_dhr_qc_path,
+                            pre_dhr_qc_image(
+                                he_patch, affine_patch, sid, pair_id, pre_dhr, pre_dhr_passed
+                            ),
+                        )
+                        if not pre_dhr_passed:
+                            public["status"] = "pre_dhr_affine_rejected"
+                            public["qc_rejection_reason"] = pre_dhr_rejection_reason(pre_dhr, args)
+                            public["qc_path"] = str(pre_dhr_qc_path)
+                            public["updated_at"] = utc_now()
+                            private.update(public)
+                            public_by_id[sid] = public
+                            private_by_id[sid] = private
+                            continue
+
                     dhr_context, dhr_meta = run_dhr(
                         ihc_affine_context,
                         he_context,
@@ -986,6 +1109,7 @@ def summarize(args):
                 ),
                 "ready": counts["ready"],
                 "roi_integrity_rejected": counts["roi_integrity_rejected"],
+                "pre_dhr_affine_rejected": counts["pre_dhr_affine_rejected"],
                 "low_tissue": counts["low_tissue"],
                 "low_valid_fraction": counts["low_valid_fraction"],
                 "failed": counts["failed"],
@@ -1010,6 +1134,7 @@ def summarize(args):
             "planned",
             "ready",
             "roi_integrity_rejected",
+            "pre_dhr_affine_rejected",
             "low_tissue",
             "low_valid_fraction",
             "failed",
@@ -1102,21 +1227,38 @@ def build_parser():
             "--" + key.replace("_", "-"), type=int, default=cfg[key]
         )
 
-    for key in [
-        "min_tissue_fraction",
-        "min_valid_fraction",
-        "roi_integrity_min_gray_corr",
-        "roi_integrity_min_edge_corr",
-        "roi_integrity_min_mask_iou",
-        "dhr_valid_mask_threshold",
-    ]:
+    float_defaults = {
+        "min_tissue_fraction": cfg["min_tissue_fraction"],
+        "min_valid_fraction": cfg["min_valid_fraction"],
+        "roi_integrity_min_gray_corr": cfg["roi_integrity_min_gray_corr"],
+        "roi_integrity_min_edge_corr": cfg["roi_integrity_min_edge_corr"],
+        "roi_integrity_min_mask_iou": cfg["roi_integrity_min_mask_iou"],
+        "pre_dhr_min_affine_tissue_fraction": cfg.get("pre_dhr_min_affine_tissue_fraction", 0.10),
+        "pre_dhr_min_tissue_ratio": cfg.get("pre_dhr_min_tissue_ratio", 0.35),
+        "pre_dhr_min_tissue_dice": cfg.get("pre_dhr_min_tissue_dice", 0.60),
+        "pre_dhr_max_centroid_distance_norm": cfg.get("pre_dhr_max_centroid_distance_norm", 0.20),
+        "dhr_valid_mask_threshold": cfg["dhr_valid_mask_threshold"],
+    }
+    for key, default in float_defaults.items():
         parser.add_argument(
-            "--" + key.replace("_", "-"), type=float, default=cfg[key]
+            "--" + key.replace("_", "-"), type=float, default=default
         )
+
+    parser.add_argument(
+        "--enable-pre-dhr-overlap-gate",
+        dest="enable_pre_dhr_overlap_gate",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--disable-pre-dhr-overlap-gate",
+        dest="enable_pre_dhr_overlap_gate",
+        action="store_false",
+    )
 
     parser.set_defaults(
         pair_ids=cfg["pair_ids"],
         dhr_overrides=cfg["dhr_overrides"],
+        enable_pre_dhr_overlap_gate=bool(cfg.get("enable_pre_dhr_overlap_gate", False)),
     )
     return parser
 

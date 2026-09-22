@@ -65,5 +65,30 @@ class TestMaterializeRegistrationV1Patches(unittest.TestCase):
             self.assertLessEqual(y + 1024, 6000)
 
 
+class TestPreDhrOverlapGate(unittest.TestCase):
+    def setUp(self):
+        self.args = argparse.Namespace(
+            pre_dhr_min_affine_tissue_fraction=0.10,
+            pre_dhr_min_tissue_ratio=0.35,
+            pre_dhr_min_tissue_dice=0.60,
+            pre_dhr_max_centroid_distance_norm=0.20,
+        )
+
+    def test_rejects_missing_affine_tissue(self):
+        he = np.full((128, 128, 3), 255, np.uint8)
+        aff = np.full_like(he, 255)
+        he[16:112, 16:112] = (120, 40, 120)
+        metrics = mod.tissue_overlap_metrics(he, aff)
+        self.assertFalse(mod.pre_dhr_overlap_passes(metrics, self.args))
+
+    def test_accepts_matching_tissue_support(self):
+        he = np.full((128, 128, 3), 255, np.uint8)
+        aff = np.full_like(he, 255)
+        he[16:112, 16:112] = (120, 40, 120)
+        aff[18:114, 18:114] = (160, 100, 40)
+        metrics = mod.tissue_overlap_metrics(he, aff)
+        self.assertTrue(mod.pre_dhr_overlap_passes(metrics, self.args))
+
+
 if __name__ == "__main__":
     unittest.main()

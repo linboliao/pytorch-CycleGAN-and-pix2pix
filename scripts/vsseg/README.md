@@ -179,3 +179,33 @@ The canonical manifests/patch_manifest.csv can be passed directly to the
 vsseg_paired Dataset adapter. Do not promote pilot_v0 into the full dataset
 without reviewing the contact sheets and representative per-patch registration
 QC.
+
+## pilot_v1 pre-DHR local overlap gate
+
+pilot_v1 adds a local affine-overlap gate between affine warping and DHR.
+This catches patches where both WSI reads are individually valid but the
+affine-warped IHC tissue does not actually overlap the HE training region.
+
+Formal config:
+
+    configs/vsseg/patches_registration_v1_pilot_v1.json
+
+Default thresholds:
+
+    affine IHC tissue fraction >= 0.10
+    affine-IHC / HE tissue ratio >= 0.35
+    HE-vs-affine-IHC tissue Dice >= 0.60
+    normalized tissue-centroid distance <= 0.20
+
+The gate is evaluated on the final 1024 center region before DHR. Rejected
+samples use:
+
+    status = pre_dhr_affine_rejected
+
+Rejected samples do not run DHR and do not write HE/IHC training images.
+A pre-DHR QC image is written under:
+
+    qc/pre_dhr/<PAIR_ID>/<PATCH_ID>.png
+
+The previous pilot_v0 config remains gate-disabled for historical
+reproducibility. pilot_v1 explicitly enables the gate.
