@@ -1,0 +1,22 @@
+{
+  "dataset_version": "dual_v1",
+  "pair_type": "HE-p63+CKpan_dual",
+  "public_pair_inventory": "/NAS145/linboliao/Data/VS-Seg/manifests/pair_inventory.csv",
+  "private_pair_inventory": "/NAS145/linboliao/Data/VS-Seg/derived/registration_v0_manual_v2/private/manual_pair_inventory_internal.csv",
+  "registration_config": "/NAS3/lbliao/Code-138/pytorch-CycleGAN-and-pix2pix/configs/vsseg/registration_v1_component.json",
+  "registration_output_root": "/NAS145/linboliao/Data/VS-Seg/derived/registration_v1_component",
+  "registration_report_root": "/NAS145/linboliao/Data/VS-Seg/reports/dataset_audit/registration_v1_component",
+  "cohort_report_root": "/NAS145/linboliao/Data/VS-Seg/reports/dataset_audit/dual_v1",
+  "patch_output_root": "/NAS145/linboliao/Data/VS-Seg/derived/patches/registration_v1_component/ps1024_ctx2048/dual_v1",
+  "patch_size": 1024,
+  "context_size": 2048,
+  "stride": 1024,
+  "max_patches_per_pair": 256,
+  "min_tissue_fraction": 0.50,
+  "min_valid_fraction": 0.98,
+  "enable_pre_dhr_overlap_gate": true,
+  "pre_dhr_min_affine_tissue_fraction": 0.10,
+  "pre_dhr_min_tissue_ratio": 0.35,
+  "pre_dhr_min_tissue_dice": 0.60,
+  "pre_dhr_max_centroid_distance_norm": 0.20
+}
